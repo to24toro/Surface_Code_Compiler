@@ -21,6 +21,10 @@ def compile_qcb(dag, height, width,
                 *externs,
                 verbose=False,
                 extern_allocation_method='dynamic',
+                use_ml=False,
+                nn_model_path=None,
+                log_jsonl=False,
+                jsonl_path=None,
                 qcb_kwargs = None,
                 allocator_kwargs = None,
                 graph_kwargs = None,
@@ -31,54 +35,77 @@ def compile_qcb(dag, height, width,
                 compiled_qcb_kwargs = None
                 ):
 
-    if verbose:
-        print(f"Compiling {dag}")
-        print("\tConstructing QCB...")
+    import contextlib
+    import time
 
-    if qcb_kwargs is None:
-        qcb_kwargs = dict()
-    qcb = QCB(height, width, dag, **qcb_kwargs)
-    dag.verbose=verbose
+    # Initialize ML client
+    nn_client = None
+    if use_ml:
+        from surface_code_routing.nn_client import NnClient
+        nn_client = NnClient(model_path=nn_model_path, enabled=True)
 
-    if verbose:
-        print("\tAllocating QCB...")
+    # Initialize logger
+    jsonl_logger = None
+    if log_jsonl:
+        from surface_code_routing.jsonl_logger import JsonlLogger
+        if jsonl_path is None:
+            jsonl_path = f"routing_log_{int(time.time())}.jsonl"
+        jsonl_logger = JsonlLogger(jsonl_path, enabled=True)
 
-    if allocator_kwargs is None:
-        allocator_kwargs = dict()
-    allocator = Allocator(qcb, *externs, tikz_build=True, verbose=verbose, **allocator_kwargs)
-    qcb.allocator = allocator
+    # Use context manager for logger
+    logger_context = jsonl_logger if jsonl_logger else contextlib.nullcontext()
 
-    if verbose:
-        print("\tConstructing Mapping")
+    with logger_context:
+        if verbose:
+            print(f"Compiling {dag}")
+            print("\tConstructing QCB...")
 
-    if graph_kwargs is None:
-        graph_kwargs = dict()
-    graph = QCBGraph(qcb, **graph_kwargs)
+        if qcb_kwargs is None:
+            qcb_kwargs = dict()
+        qcb = QCB(height, width, dag, **qcb_kwargs)
+        dag.verbose=verbose
 
-    if tree_kwargs is None:
-        tree_kwargs = dict()
-    tree = QCBTree(graph, **tree_kwargs)
+        if verbose:
+            print("\tAllocating QCB...")
 
-    if mapper_kwargs is None:
-        mapper_kwargs = {'extern_allocation_method':extern_allocation_method}
-    elif 'extern_allocation_method' not in mapper_kwargs:
-        mapper_kwargs['extern_allocation_method'] = extern_allocation_method
+        if allocator_kwargs is None:
+            allocator_kwargs = dict()
+        allocator = Allocator(qcb, *externs, tikz_build=True, verbose=verbose, **allocator_kwargs)
+        qcb.allocator = allocator
 
-    mapper = QCBMapper(dag, tree, **mapper_kwargs)
+        if verbose:
+            print("\tConstructing Mapping")
 
-    if verbose:
-        print("\tRouting...")
-    circuit_model = PatchGraph(qcb.shape, mapper, None)
-    # TODO pass this through
-    rot_injector = RotationInjector(dag, mapper, qcb, graph=circuit_model, verbose=verbose)
+        if graph_kwargs is None:
+            graph_kwargs = dict()
+        graph = QCBGraph(qcb, **graph_kwargs)
 
-    if router_kwargs is None:
-        router_kwargs = dict()
-    router = QCBRouter(qcb, dag, mapper, graph=circuit_model, verbose=verbose, **router_kwargs)
+        if tree_kwargs is None:
+            tree_kwargs = dict()
+        tree = QCBTree(graph, **tree_kwargs)
 
-    if compiled_qcb_kwargs is None:
-        compiled_qcb_kwargs = dict()
-    compiled_qcb = CompiledQCB(qcb, router, dag, **compiled_qcb_kwargs)
+        if mapper_kwargs is None:
+            mapper_kwargs = {'extern_allocation_method':extern_allocation_method}
+        elif 'extern_allocation_method' not in mapper_kwargs:
+            mapper_kwargs['extern_allocation_method'] = extern_allocation_method
+
+        mapper = QCBMapper(dag, tree, **mapper_kwargs)
+
+        if verbose:
+            print("\tRouting...")
+        circuit_model = PatchGraph(qcb.shape, mapper, None)
+        # TODO pass this through
+        rot_injector = RotationInjector(dag, mapper, qcb, graph=circuit_model, verbose=verbose)
+
+        if router_kwargs is None:
+            router_kwargs = dict()
+        router = QCBRouter(qcb, dag, mapper, graph=circuit_model, verbose=verbose,
+                          nn_client=nn_client, jsonl_logger=jsonl_logger, **router_kwargs)
+
+        if compiled_qcb_kwargs is None:
+            compiled_qcb_kwargs = dict()
+        compiled_qcb = CompiledQCB(qcb, router, dag, **compiled_qcb_kwargs)
+
     return compiled_qcb
 
 class CompiledQCB:

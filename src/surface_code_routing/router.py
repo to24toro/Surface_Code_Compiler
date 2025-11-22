@@ -28,7 +28,7 @@ class QCBRouter:
         Attempts to route the DAG given a QCB layout
     '''
 
-    def __init__(self, qcb:QCB, dag:DAG, mapper:QCBMapper, graph=None, auto_route=True, verbose=False, teleport=True):
+    def __init__(self, qcb:QCB, dag:DAG, mapper:QCBMapper, graph=None, auto_route=True, verbose=False, teleport=True, nn_client=None, jsonl_logger=None):
         '''
             Initialise the router
         '''
@@ -49,6 +49,10 @@ class QCBRouter:
 
         self.anc: dict[Any, ANC] = {}
         self.resolved: set[DAGNode] = set()
+
+        # ML components
+        self.nn_client = nn_client
+        self.jsonl_logger = jsonl_logger
 
         if teleport:
             self.teleport_injector = TeleportInjector(self)
@@ -317,7 +321,14 @@ class QCBRouter:
             if end_symbol.is_extern():
                 end_orientation = end_node.orientation
 
-            path = self.graph.route(start_node, end_node, gate, start_orientation=start_orientation, end_orientation=end_orientation)
+            path = self.graph.route(
+                start_node, end_node, gate,
+                start_orientation=start_orientation,
+                end_orientation=end_orientation,
+                nn_client=self.nn_client,
+                jsonl_logger=self.jsonl_logger,
+                router_context=self
+            )
             if path is not PatchGraph.NO_PATH_FOUND:
                 paths += path
             else:

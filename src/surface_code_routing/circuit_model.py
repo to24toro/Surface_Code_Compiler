@@ -364,10 +364,17 @@ class PatchGraph:
         track_rotations=True,  # Rotation tracking
         start_orientation=None,  # Orietnation of start node
         end_orientation=None,  # Orientation of end node
+        nn_client=None,  # ML client
+        jsonl_logger=None,  # JSONL logger
+        router_context=None  # Router context for global features
     ):
         """
-        route
-        Attempts to route from start to end using a given gate as a resource lock
+        ML-augmented A* (MINIMAL state)
+
+        Improvements:
+        - Enhanced pruning with goal-directional boost
+        - Policy uses raw logits (no softmax)
+        - Value head replaces heuristic when ML enabled
         """
 
         if heuristic is None:
@@ -382,12 +389,14 @@ class PatchGraph:
         path_cost[start] = 0
 
         orientation = None
+
         while not frontier.empty():
             current = frontier.get()[1]
+
             if current == end:
                 break
 
-            # Correct join at the start
+            # Orientation handling
             if track_rotations and current == start:
                 orientation = start_orientation
                 debug_print(
@@ -398,32 +407,111 @@ class PatchGraph:
                     debug=self.verbose,
                 )
 
-            for i in current.adjacent(gate, orientation=orientation):
-                # Correct join at the end, currently causes deadlocks
-                # if track_rotations and i == end:
-                #    if current not in end.adjacent(gate, orientation=end_orientation):
-                #        continue
-                if (i == end and current != start) or i.state == SCPatch.ROUTE:
-                    cost = path_cost[current] + i.cost()
-                    if i not in path_cost or cost < path_cost[i]:
-                        path_cost[i] = cost
-                        frontier.put((cost + heuristic(i, end), i))
-                        path[i] = current
+            # Get adjacent nodes (candidates)
+            adj_nodes = list(current.adjacent(gate, orientation=orientation))
+
+            if len(adj_nodes) == 0:
+                if current == start:
+                    orientation = None
+                continue
+
+            # Build MINIMAL state (ONCE per expansion)
+            if nn_client and nn_client.enabled:
+                routing_state = self._build_minimal_state(
+                    current, start, end, path_cost,
+                    adj_nodes, router_context, gate
+                )
+
+                # ONE forward pass
+                nn_output = nn_client.forward(routing_state)
+                value_estimate = nn_output['value']
+                prune_scores = nn_output['prune_scores']
+                policy_logits = nn_output['policy_logits']
+            else:
+                value_estimate = 0.0
+                prune_scores = [0.0] * len(adj_nodes)
+                policy_logits = [0.0] * len(adj_nodes)
+
+            # Sort neighbors by policy logits (descending, raw logits)
+            sorted_neighbors = sorted(
+                zip(adj_nodes, prune_scores, policy_logits),
+                key=lambda x: -x[2]  # Descending by policy logit
+            )
+
+            # Track if we expanded any neighbor
+            expanded_any = False
+            chosen_neighbor = None
+            chosen_cost = None
+
+            # Expand neighbors
+            current_dist_to_goal = abs(current.y - end.y) + abs(current.x - end.x)
+
+            for neighbor, prune_score, policy_logit in sorted_neighbors:
+                # Enhanced pruning logic
+                # Base pruning score from NN
+                effective_prune_score = prune_score
+
+                # Boost prune score if neighbor increases Manhattan distance to goal
+                neighbor_dist_to_goal = abs(neighbor.y - end.y) + abs(neighbor.x - end.x)
+                if neighbor_dist_to_goal > current_dist_to_goal:
+                    effective_prune_score += 0.2
+
+                # Prune if effective score > 0.5
+                if effective_prune_score > 0.5:
+                    continue
+
+                if (neighbor == end and current != start) or neighbor.state == SCPatch.ROUTE:
+                    cost = path_cost[current] + neighbor.cost()
+
+                    # Use ML value estimate OR classical heuristic
+                    if nn_client and nn_client.enabled:
+                        h_value = value_estimate
+                    else:
+                        h_value = heuristic(neighbor, end)
+
+                    if neighbor not in path_cost or cost < path_cost[neighbor]:
+                        path_cost[neighbor] = cost
+                        frontier.put((cost + h_value, neighbor))
+                        path[neighbor] = current
+
+                        # Record first successful expansion for logging
+                        if not expanded_any:
+                            expanded_any = True
+                            chosen_neighbor = (neighbor.y, neighbor.x)
+                            chosen_cost = cost
+
+            # Log expansion (ONCE, with chosen neighbor)
+            if jsonl_logger and jsonl_logger.enabled and nn_client and nn_client.enabled:
+                if chosen_neighbor is not None:
+                    jsonl_logger.log_expansion(
+                        state=routing_state,
+                        chosen_neighbor=chosen_neighbor,
+                        chosen_cost=chosen_cost
+                    )
+
             if current == start:
                 orientation = None
+
         else:
+            # No path found
+            if jsonl_logger and jsonl_logger.enabled:
+                jsonl_logger.log_search_complete(
+                    final_cost=float('inf'),
+                    path_length=0,
+                    found=False
+                )
             return self.NO_PATH_FOUND
 
-        def traverse(path, end):
-            """
-            Helper function
-            """
-            next_end = path[end]
-            if next_end is not None:
-                return [next_end] + traverse(path, next_end)
-            return []
+        # Path found
+        final_route = self._traverse_path(path, end)[::-1] + [end]
 
-        final_route = traverse(path, end)[::-1] + [end]
+        if jsonl_logger and jsonl_logger.enabled:
+            jsonl_logger.log_search_complete(
+                final_cost=path_cost[end],
+                path_length=len(final_route),
+                found=True
+            )
+
         return final_route
 
     def ancillae(self, gate, start, n_ancillae):
@@ -508,6 +596,164 @@ class PatchGraph:
             if anc.lock_state is not gate:
                 return [anc]
         return self.NO_PATH_FOUND
+
+    def _encode_patch_features(self, patch, goal_pos, current_gate) -> np.ndarray:
+        """
+        Encode single patch to 13D feature vector
+
+        Features:
+        [0-4]: patch type (one-hot: ROUTE, REG, IO, EXTERN, NONE)
+        [5-6]: orientation (one-hot: X, Z)
+        [7]: is_locked (any lock)
+        [8]: locked_by_self (locked by current gate)
+        [9]: locked_by_other (locked by different gate)
+        [10]: active_flag (in ancilla/scope states)
+        [11]: distance_to_goal (normalized)
+        [12]: reserved
+        """
+        features = np.zeros(13, dtype=np.float32)
+
+        # Patch type (one-hot, 5 dims)
+        patch_types = [SCPatch.ROUTE, SCPatch.REG, SCPatch.IO,
+                       SCPatch.EXTERN, SCPatch.NONE]
+        for i, pt in enumerate(patch_types):
+            if patch.state == pt:
+                features[i] = 1.0
+
+        # Orientation (one-hot, 2 dims)
+        if patch.orientation == PatchGraphNode.X_ORIENTED:
+            features[5] = 1.0
+        else:
+            features[6] = 1.0
+
+        # Lock states
+        is_locked = patch.lock_state != PatchGraphNode.INITIAL_LOCK_STATE
+        features[7] = 1.0 if is_locked else 0.0
+
+        # Locked by current gate
+        if current_gate and patch.lock_state is current_gate:
+            features[8] = 1.0
+
+        # Locked by other gate
+        if is_locked and current_gate and patch.lock_state is not current_gate:
+            features[9] = 1.0
+
+        # Active flag
+        if patch.state in PatchGraphNode.ANCILLAE_STATES or patch.state in PatchGraphNode.SCOPE_STATES:
+            features[10] = 1.0
+
+        # Distance to goal (normalized)
+        gy, gx = goal_pos
+        dist = abs(patch.y - gy) + abs(patch.x - gx)
+        features[11] = dist / 100.0  # Normalize
+
+        # Reserved
+        features[12] = 0.0
+
+        return features
+
+    def _build_minimal_state(self, current, start, end, path_cost,
+                            adj_nodes, router_context, gate):
+        """
+        Build MINIMAL RoutingState (NO full grid dump)
+
+        Computes enhanced global features:
+        - active_area_density
+        - route_congestion (7×7 region)
+        - factory_load
+        - global_distance_ratio
+        """
+        from surface_code_routing.routing_state import RoutingState
+
+        cy, cx = current.y, current.x
+        gy, gx = end.y, end.x
+        sy, sx = start.y, start.x
+
+        # Extract 5×5 local window
+        local_window = np.zeros((5, 5, 13), dtype=np.float32)
+
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                y, x = cy + dy, cx + dx
+                if 0 <= y < self.shape[0] and 0 <= x < self.shape[1]:
+                    patch = self.graph[y, x]
+                    features = self._encode_patch_features(patch, (gy, gx), gate)
+                    local_window[dy + 2, dx + 2] = features
+
+        # Get global context
+        if router_context:
+            current_cycle = len(router_context.layers)
+            current_stv = router_context.space_time_volume
+            n_active = len(router_context.active_gates)
+            n_waiting = len([g for g in router_context.dag.gates
+                            if g not in router_context.resolved])
+        else:
+            current_cycle = 0
+            current_stv = 0
+            n_active = 0
+            n_waiting = 0
+
+        # Compute enhanced global features
+        # 1. Active area density
+        total_patches = self.shape[0] * self.shape[1]
+        active_patches = 0
+        for row in self.graph:
+            for patch in row:
+                if patch.state in PatchGraphNode.ANCILLAE_STATES or patch.state in PatchGraphNode.SCOPE_STATES:
+                    active_patches += 1
+        active_area_density = active_patches / total_patches if total_patches > 0 else 0.0
+
+        # 2. Route congestion (7×7 region centered at current)
+        route_congestion = 0
+        for dy in range(-3, 4):
+            for dx in range(-3, 4):
+                y, x = cy + dy, cx + dx
+                if 0 <= y < self.shape[0] and 0 <= x < self.shape[1]:
+                    patch = self.graph[y, x]
+                    if patch.lock_state != PatchGraphNode.INITIAL_LOCK_STATE:
+                        route_congestion += 1
+
+        # 3. Factory load
+        if router_context:
+            factory_load = len([g for g in router_context.active_gates if g.is_factory()])
+        else:
+            factory_load = 0
+
+        # 4. Global distance ratio
+        start_end_manhattan = abs(sy - gy) + abs(sx - gx)
+        max_dimension = max(self.shape[0], self.shape[1])
+        global_distance_ratio = start_end_manhattan / max_dimension if max_dimension > 0 else 0.0
+
+        # Manhattan heuristic for h_cost (logging/training only)
+        h_cost = abs(cy - gy) + abs(cx - gx)
+
+        return RoutingState(
+            current_pos=(cy, cx),
+            goal_pos=(gy, gx),
+            start_pos=(sy, sx),
+            g_cost=path_cost.get(current, 0.0),
+            h_cost=h_cost,
+            local_window=local_window,
+            grid_shape=self.shape,
+            current_cycle=current_cycle,
+            current_stv=current_stv,
+            n_active_gates=n_active,
+            n_waiting_gates=n_waiting,
+            gate_id=str(gate.get_symbol()) if gate else "unknown",
+            active_area_density=active_area_density,
+            route_congestion=float(route_congestion),
+            factory_load=factory_load,
+            global_distance_ratio=global_distance_ratio,
+            neighbors=[(n.y, n.x) for n in adj_nodes],
+            neighbor_costs=[path_cost.get(current, 0.0) + n.cost() for n in adj_nodes]
+        )
+
+    def _traverse_path(self, path, end):
+        """Helper to traverse path"""
+        next_end = path[end]
+        if next_end is not None:
+            return [next_end] + self._traverse_path(path, next_end)
+        return []
 
     @staticmethod
     def heuristic(a, b, bias=1 + 1e-7):
